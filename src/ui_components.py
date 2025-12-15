@@ -824,6 +824,9 @@ class RaceProgressBarComponent(BaseComponent):
             
     def on_mouse_press(self, window, x: float, y: float, button: int, modifiers: int) -> bool:
         """Handle mouse click to seek to position."""
+        if not self._visible:
+            return False
+            
         if (self._bar_left <= x <= self._bar_left + self._bar_width and
             self.bottom - 5 <= y <= self.bottom + self.height + 5):
             
