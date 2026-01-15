@@ -36,6 +36,10 @@ class StateSpaceConfig:
     
     enable_warmup: bool = True
     warmup_laps: int = 3
+    
+    # New SOFT-specific parameters
+    soft_warmup_laps: int = 1
+    soft_max_analysis_laps: int = 10
 
 
 class BayesianTyreDegradationModel:
@@ -124,12 +128,16 @@ class BayesianTyreDegradationModel:
         return laps
     
     def _estimate_parameters(self, laps_df: pd.DataFrame):
+        # Accumulate slopes across all stints for averaging
+        compound_slopes = {'HARD': [], 'MEDIUM': [], 'SOFT': []}
+        
         # Group by compound and estimate degradation rates
         for compound in ['HARD', 'MEDIUM', 'SOFT']:
             compound_laps = laps_df[laps_df['Compound'] == compound]
             
             if len(compound_laps) < 5:
                 continue
+                
             for driver in compound_laps['Driver'].unique():
                 driver_laps = compound_laps[compound_laps['Driver'] == driver]
                 
@@ -143,46 +151,74 @@ class BayesianTyreDegradationModel:
                     stint_laps = stint_laps.copy()
                     stint_laps['LapOnTyre'] = range(1, len(stint_laps) + 1)
                     
-
                     first_lap_time = stint_laps.iloc[0]['LapTimeSeconds']
                     fuel_corrected = (
                         stint_laps['LapTimeSeconds']
                         - self.fuel_effect * stint_laps['FuelMass']
-                        )
+                    )
 
                     first_fc = fuel_corrected.iloc[0]
                     stint_laps['DeltaFromFirst'] = fuel_corrected - first_fc
 
                     
-                    
                     if self.config.enable_warmup:
-                        warmup_laps = self.config.warmup_laps
+                        if compound == 'SOFT':
+                            warmup_laps = self.config.soft_warmup_laps
+                        else:
+                            warmup_laps = self.config.warmup_laps
                         analysis_laps = stint_laps[stint_laps['LapOnTyre'] > warmup_laps]
                     else:
                         analysis_laps = stint_laps
                     
+                    if compound == 'SOFT':
+                        analysis_laps = analysis_laps[
+                            analysis_laps['LapOnTyre'] <= self.config.soft_max_analysis_laps
+                        ]
+                    
                     if len(analysis_laps) > 2:
-                        # Linear fit: delta = ν * lap_on_tyre
                         x = analysis_laps['LapOnTyre'].values
                         y = analysis_laps['DeltaFromFirst'].values
                         
-                        # Robust linear regression
                         if len(x) > 0 and np.std(y) > 0:
-                            slope = np.polyfit(x, y, 1)[0]
+                            slope, _, _, _ = stats.theilslopes(y, x)
+                            slope = max(0, slope)
                             
-                            # Update degradation rate (weighted average with prior)
-                            prior_weight = 0.6
-                            self.degradation_rates[compound] = (
-                                prior_weight * self.degradation_rates[compound] +
-                                (1 - prior_weight) * max(0, slope)
-                            )
-        if(
-            "HARD" in self.degradation_rates
-            and "MEDIUM" in self.degradation_rates
-        ):
-            self.degradation_rates["HARD"]=min(
-                self.degradation_rates["HARD"], 0.6* self.degradation_rates["MEDIUM"]
+                            compound_slopes[compound].append(slope)
+        
+        for compound in ['HARD', 'MEDIUM', 'SOFT']:
+            if len(compound_slopes[compound]) > 0:
+                median_slope = np.median(compound_slopes[compound])
+                
+                
+                if compound == 'SOFT':
+                    prior_weight = 0.2  # Trust data heavily for SOFTs
+                elif compound == 'HARD':
+                    prior_weight = 0.5  # Medium trust for HARDs
+                else:
+                    prior_weight = 0.4  # Medium trust for MEDIUMs
+                
+                self.degradation_rates[compound] = (
+                    prior_weight * self.degradation_rates[compound] +
+                    (1 - prior_weight) * median_slope
+                )
+        
+        if "HARD" in self.degradation_rates and "MEDIUM" in self.degradation_rates:
+            self.degradation_rates["HARD"] = min(
+                self.degradation_rates["HARD"], 
+                0.6 * self.degradation_rates["MEDIUM"]
             )
+        
+        if "SOFT" in self.degradation_rates and "MEDIUM" in self.degradation_rates:
+            self.degradation_rates["SOFT"] = min(
+                self.degradation_rates["SOFT"],
+                1.4 * self.degradation_rates["MEDIUM"]
+            )
+            
+            self.degradation_rates["SOFT"] = max(
+                self.degradation_rates["SOFT"],
+                1.05 * self.degradation_rates["MEDIUM"]
+            )
+    
     def _compute_latent_states(self, laps_df: pd.DataFrame):
         self._latent_states = {}
         self._latent_uncertainty = {}
@@ -217,16 +253,18 @@ class BayesianTyreDegradationModel:
                     prev_stint = stint
                 else:
                     nu = self.degradation_rates[compound]
-                    mu_pred = mu_alpha + nu
+                    
+                    mu_pred_temp = mu_alpha + nu
                     var_pred = var_alpha + proc_var
-
-                    expected_lap = mu_pred + self.fuel_effect * fuel
+                    
+                    expected_lap = mu_pred_temp + self.fuel_effect * fuel
                     innovation = lap_time - expected_lap
-
+                    
                     innovation_var = var_pred + obs_var
                     kalman_gain = var_pred / innovation_var
                     
-                    effective_nu=nu*(1-kalman_gain)
+                    effective_nu = nu * (1 - kalman_gain)
+                    mu_pred = mu_alpha + effective_nu
 
                     mu_alpha = mu_pred + kalman_gain * innovation
                     var_alpha = (1.0 - kalman_gain) * var_pred
@@ -360,5 +398,3 @@ class BayesianTyreDegradationModel:
             'uncertainty': info['std_dev'],
             'latent_pace': info['latent_pace']
         }
-
-
